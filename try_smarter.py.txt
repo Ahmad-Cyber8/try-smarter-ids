@@ -1,0 +1,130 @@
+from scapy.all import IP, TCP, Raw, sniff, send
+import subprocess
+from collections import defaultdict
+from datetime import datetime, timedelta
+import time
+import threading
+
+scan_tracker = defaultdict(lambda: {"count": 0, "timestamp": None})
+BLOCK_DURATION = timedelta(minutes=10)
+INTERFACE = "ens33"
+unblock_tasks = []
+
+def is_ip_blocked(ip):
+    result = subprocess.run(["sudo", "iptables", "-L", "-n"], stdout=subprocess.PIPE, text=True)
+    return ip in result.stdout
+
+def block_ip(ip):
+    if is_ip_blocked(ip):
+        print(f"[!] IP {ip} is already blocked. Skipping...")
+        return
+    print(f"[+] Blocking IP: {ip}")
+    try:
+        subprocess.run(["sudo", "iptables", "-I", "INPUT", "1", "-s", ip, "-j", "DROP"], check=True)
+        print(f"[OK] IP {ip} successfully blocked.")
+    except subprocess.CalledProcessError as e:
+        print(f"[X] Error blocking IP {ip}: {e}")
+
+def unblock_ip(ip):
+    print(f"[+] Unblocking IP: {ip}")
+    try:
+        subprocess.run(["sudo", "iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"], check=True)
+        print(f"[OK] IP {ip} successfully unblocked.")
+    except subprocess.CalledProcessError as e:
+        print(f"[X] Error unblocking IP {ip}: {e}")
+
+def unblock_expired_ips():
+    now = datetime.now()
+    for task in list(unblock_tasks):
+        if now >= task["unblock_time"]:
+            unblock_ip(task["ip"])
+            unblock_tasks.remove(task)
+
+def handle_packet(packet):
+    if not (IP in packet and TCP in packet):
+        return
+
+    src_ip = packet[IP].src
+
+    if src_ip == "127.0.0.1":
+        return
+
+    if is_ip_blocked(src_ip):
+        return
+
+    if packet[TCP].flags == "S":
+        port = packet[TCP].dport
+        src_port = packet[TCP].sport
+
+        print(f"[*] SYN detected on port {port} from {src_ip}")
+
+        current_time = datetime.now()
+        if scan_tracker[src_ip]["timestamp"] and current_time - scan_tracker[src_ip]["timestamp"] > BLOCK_DURATION:
+            scan_tracker[src_ip] = {"count": 0, "timestamp": None}
+
+        scan_tracker[src_ip]["count"] += 1
+        scan_tracker[src_ip]["timestamp"] = current_time
+
+        print(f"[*] {src_ip} SYN count: {scan_tracker[src_ip]['count']}")
+
+        if scan_tracker[src_ip]["count"] > 5:
+            print(f"[!] Port scan detected from {src_ip} - BLOCKING!")
+
+            try:
+                syn_ack = (
+                    IP(dst=src_ip, src=packet[IP].dst) /
+                    TCP(sport=port, dport=src_port, flags="SA",
+                        seq=100, ack=packet[TCP].seq + 1)
+                )
+                send(syn_ack, verbose=0, iface=INTERFACE)
+
+                data_packet = (
+                    IP(dst=src_ip, src=packet[IP].dst) /
+                    TCP(sport=port, dport=src_port, flags="PA",
+                        seq=101, ack=packet[TCP].seq + 1) /
+                    Raw(load="Try Smarter!")
+                )
+                send(data_packet, verbose=0, iface=INTERFACE)
+                print(f"[+] Sent Try Smarter! message to {src_ip}")
+            except Exception as e:
+                print(f"[X] Error sending message: {e}")
+
+            block_ip(src_ip)
+            unblock_time = datetime.now() + BLOCK_DURATION
+            print(f"[*] {src_ip} will be unblocked at {unblock_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            unblock_tasks.append({"ip": src_ip, "unblock_time": unblock_time})
+            return
+
+        try:
+            syn_ack = (
+                IP(dst=src_ip, src=packet[IP].dst) /
+                TCP(sport=port, dport=src_port, flags="SA",
+                    seq=100, ack=packet[TCP].seq + 1)
+            )
+            send(syn_ack, verbose=0, iface=INTERFACE)
+            print(f"[+] Sent SYN-ACK to {src_ip} on port {port}")
+
+            data_packet = (
+                IP(dst=src_ip, src=packet[IP].dst) /
+                TCP(sport=port, dport=src_port, flags="PA",
+                    seq=101, ack=packet[TCP].seq + 1) /
+                Raw(load="Try Smarter!")
+            )
+            send(data_packet, verbose=0, iface=INTERFACE)
+            print(f"[+] Sent Try Smarter! message to {src_ip}")
+        except Exception as e:
+            print(f"[X] Error sending packet: {e}")
+
+def start_sniffing():
+    print(f"[*] Try Smarter - Listening on {INTERFACE}...")
+    sniff(filter="tcp", iface=INTERFACE, prn=handle_packet, store=0)
+
+sniff_thread = threading.Thread(target=start_sniffing, daemon=True)
+sniff_thread.start()
+
+try:
+    while True:
+        unblock_expired_ips()
+        time.sleep(5)
+except KeyboardInterrupt:
+    print("\n[*] Stopping Try Smarter...")
